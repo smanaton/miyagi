@@ -16,7 +16,7 @@ use crate::evaluation::compare_measurements;
 use crate::fitness::FitnessMode;
 use crate::patch::{Patch, PatchValidation};
 use crate::probe::{Probe, built_in, compile_probes, load_probe_file, measure_probes};
-use crate::search::{SearchCheckpoint, SearchConfig, SearchEvent, run_search};
+use crate::search::{SearchCheckpoint, SearchConfig, SearchEvent, default_search_layers, run_search};
 
 #[derive(Parser)]
 #[command(
@@ -161,7 +161,11 @@ struct SearchArgs {
     report: Option<PathBuf>,
     #[arg(long, default_value_t = 200)]
     iters: usize,
-    #[arg(long, value_delimiter = ',')]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Comma-separated layer indices to search. Default: an even spread across the model's full depth (derived from its layer count)."
+    )]
     layers: Option<Vec<usize>>,
     #[arg(long, value_delimiter = ',', default_value = "gate_proj,up_proj")]
     projections: Vec<String>,
@@ -518,7 +522,9 @@ fn search(args: SearchArgs, json: bool) -> Result<()> {
         .map(|projection| Projection::from_str(projection))
         .collect::<Result<Vec<_>>>()?;
     let config = SearchConfig {
-        search_layers: args.layers.unwrap_or_else(|| vec![1, 2, 3, 4, 34]),
+        search_layers: args
+            .layers
+            .unwrap_or_else(|| default_search_layers(backend.architecture().layer_count())),
         search_projections: projections,
         max_iters: args.iters,
         control_penalty: args.penalty,

@@ -11,7 +11,9 @@ use crate::backend::MiyagiBackend;
 use crate::error::{Error, Result};
 use crate::fitness::{FitnessMode, compute_fitness};
 use crate::patch::{Patch, PatchFlip};
-use crate::probe::{CompiledProbe, ProbeMeasurement, measure_probes};
+use crate::probe::{
+    CompiledProbe, ProbeMeasurement, measure_probes, measure_probes_allowing_non_finite,
+};
 
 const CHECKPOINT_VERSION: u32 = 1;
 
@@ -33,7 +35,10 @@ pub struct SearchConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            search_layers: vec![1, 2, 3, 4, 34],
+            // Empty means "resolve from the live backend in run_search via
+            // default_search_layers(layer_count)". Do not bake a fixed layer
+            // count here — that reintroduces 8B-era under-search on larger models.
+            search_layers: Vec::new(),
             search_projections: vec![Projection::Gate, Projection::Up],
             max_iters: 200,
             control_penalty: 2.0,
@@ -44,6 +49,46 @@ impl Default for SearchConfig {
             patch_description: String::new(),
             base_model: "unknown".to_owned(),
         }
+    }
+}
+
+/// Upper bound on how many layers the computed default samples.
+const MAX_DEFAULT_LAYERS: usize = 12;
+
+/// Evenly spaced layer indices spanning the model's full depth, used when the
+/// caller does not pass `--layers` (or leaves `SearchConfig.search_layers` empty).
+///
+/// A fixed absolute list (the old `[1, 2, 3, 4, 34]`) silently under-searches
+/// any model deeper than the 8B it was tuned for — e.g. on a 64-layer model it
+/// never samples past layer 34, capping results with no warning.
+///
+/// - **Large models** (`layer_count > MAX_DEFAULT_LAYERS`): up to
+///   `MAX_DEFAULT_LAYERS` points across `1..=layer_count-1` (skips layer 0).
+/// - **Small models** (`layer_count ≤ MAX_DEFAULT_LAYERS`): every layer index
+///   in `0..layer_count` (includes layer 0).
+pub fn default_search_layers(layer_count: usize) -> Vec<usize> {
+    if layer_count == 0 {
+        return Vec::new();
+    }
+    if layer_count <= MAX_DEFAULT_LAYERS {
+        return (0..layer_count).collect();
+    }
+    let last = layer_count - 1;
+    let span = last - 1; // spread across [1, last]
+    let steps = MAX_DEFAULT_LAYERS - 1;
+    let mut layers: Vec<usize> = (0..MAX_DEFAULT_LAYERS)
+        .map(|i| 1 + (span * i + steps / 2) / steps) // integer round
+        .collect();
+    layers.dedup();
+    layers
+}
+
+/// Fill empty `search_layers` from the live backend architecture.
+pub fn resolve_search_layers(layer_count: usize, search_layers: &[usize]) -> Vec<usize> {
+    if search_layers.is_empty() {
+        default_search_layers(layer_count)
+    } else {
+        search_layers.to_vec()
     }
 }
 
@@ -165,12 +210,19 @@ where
     B: MiyagiBackend,
     F: FnMut(&SearchEvent),
 {
+    let mut config = config;
+    config.search_layers = resolve_search_layers(
+        backend.architecture().layer_count(),
+        &config.search_layers,
+    );
     validate_config(backend, target_probes, control_probes, &config)?;
     let candidates = build_candidates(backend, &config)?;
     if candidates.is_empty() {
         return Err(Error::InvalidSearch("candidate pool is empty".to_owned()));
     }
 
+    // Baselines must be finite (strict measure_probes). Candidate flips may
+    // produce NaN — those use measure_probes_allowing_non_finite below.
     let fresh_target_baseline = measure_probes(backend, target_probes)?;
     let fresh_control_baseline = measure_probes(backend, control_probes)?;
     let architecture_signature = backend.architecture().signature().to_owned();
@@ -405,11 +457,12 @@ fn evaluate_candidate<B: MiyagiBackend>(
         .iter()
         .map(|index| target_probes[*index].clone())
         .collect::<Vec<_>>();
-    let screen_measurements = measure_probes(backend, &screen_probes)?;
+    // Candidate path: allow non-finite gaps (reject this flip, keep searching).
+    let screen_measurements = measure_probes_allowing_non_finite(backend, &screen_probes)?;
     if !screen_measurements.iter().any(|measurement| {
-        baseline_by_name
-            .get(&measurement.name)
-            .is_some_and(|baseline| measurement.gap > *baseline)
+        baseline_by_name.get(&measurement.name).is_some_and(|baseline| {
+            measurement.gap.is_finite() && measurement.gap > *baseline
+        })
     }) {
         return Ok(CandidateEvaluation::ScreenedOut);
     }
@@ -421,7 +474,7 @@ fn evaluate_candidate<B: MiyagiBackend>(
         .collect::<BTreeMap<_, _>>();
     for (index, probe) in target_probes.iter().enumerate() {
         if let std::collections::btree_map::Entry::Vacant(entry) = measured_by_index.entry(index) {
-            let measurement = measure_probes(backend, std::slice::from_ref(probe))?
+            let measurement = measure_probes_allowing_non_finite(backend, std::slice::from_ref(probe))?
                 .into_iter()
                 .next()
                 .expect("one probe returns one measurement");
@@ -435,7 +488,15 @@ fn evaluate_candidate<B: MiyagiBackend>(
                 .expect("every target probe was measured")
         })
         .collect::<Vec<_>>();
-    let control = measure_probes(backend, control_probes)?;
+    let control = measure_probes_allowing_non_finite(backend, control_probes)?;
+    // Non-finite candidate gap → reject this flip only (NaN fails fitness >).
+    if target
+        .iter()
+        .chain(control.iter())
+        .any(|measurement| !measurement.gap.is_finite())
+    {
+        return Ok(CandidateEvaluation::Measured { fitness: f32::NAN });
+    }
     let fitness = compute_fitness(
         config.fitness_mode,
         &target,
@@ -725,6 +786,35 @@ mod tests {
         let expected = first.next_u64();
         let mut resumed = SplitMix64::from_state(state);
         assert_eq!(resumed.next_u64(), expected);
+    }
+
+    #[test]
+    fn default_layers_span_full_depth_on_large_models() {
+        // 64-layer model must reach deep layers, unlike the old fixed list.
+        let layers = default_search_layers(64);
+        assert_eq!(layers.len(), MAX_DEFAULT_LAYERS);
+        assert_eq!(*layers.first().unwrap(), 1);
+        assert_eq!(*layers.last().unwrap(), 63);
+        assert!(layers.iter().all(|&l| l < 64));
+        assert!(layers.windows(2).all(|w| w[0] < w[1]), "strictly increasing");
+        // The old default's deepest layer was 34; the new one goes well past it.
+        assert!(layers.iter().any(|&l| l > 34));
+    }
+
+    #[test]
+    fn default_layers_cover_every_layer_on_small_models() {
+        // Small models intentionally include layer 0 (see default_search_layers docs).
+        assert_eq!(default_search_layers(4), vec![0, 1, 2, 3]);
+        assert_eq!(default_search_layers(0), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn empty_search_layers_resolve_from_backend_depth() {
+        let resolved = resolve_search_layers(64, &[]);
+        assert_eq!(resolved, default_search_layers(64));
+        assert!(resolved.iter().any(|&l| l > 34));
+        let explicit = resolve_search_layers(64, &[1, 2, 3]);
+        assert_eq!(explicit, vec![1, 2, 3]);
     }
 
     #[test]
