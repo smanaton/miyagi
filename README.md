@@ -379,6 +379,25 @@ MIYAGI_TEST_GPU_LAYERS=0 \
 cargo test --no-default-features --test model_backend
 ```
 
+### Building on Windows (MSVC)
+
+Miyagi builds and runs on Windows (validated on Windows 11, Rust
+`x86_64-pc-windows-msvc`, against mainline llama.cpp b10054 with an RTX 4090).
+Notes:
+
+- With Visual Studio 18 installed, the `cmake` crate requests the
+  "Visual Studio 18 2026" generator, which needs CMake ≥ 4.3 on `PATH`
+  (VS's bundled CMake works).
+- For `--features cuda` with a VS version newer than your CUDA toolkit's VS
+  integration, use the Ninja generator inside a `vcvars64` environment of a VS
+  version the toolkit supports, e.g.:
+
+  ```bat
+  call "...\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+  set CMAKE_GENERATOR=Ninja
+  cargo build --release --features cuda
+  ```
+
 ## Compatibility and Boundaries
 
 - Miyagi supports descriptor-driven Qwen/Bonsai MLP mapping for two-dimensional
